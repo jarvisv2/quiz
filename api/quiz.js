@@ -185,8 +185,8 @@ function cleanQuestions(questions) {
 
     const question = q.question.trim();
     const options = q.options.map(x => String(x).trim());
-    const normalized = question.toLowerCase().replace(/\s+/g, ' ');
-    const uniqueOptions = new Set(options.map(x => x.toLowerCase()));
+    const normalized = question.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+    const uniqueOptions = new Set(options.map(x => x.toLowerCase().replace(/\s+/g, ' ').trim()));
     const correctIndex = Number(q.correctIndex);
 
     if (!question || !options.every(Boolean) || uniqueOptions.size !== 4) continue;
@@ -204,6 +204,93 @@ function cleanQuestions(questions) {
   }
 
   return cleaned;
+}
+
+function shuffleQuestionOptions(question, questionNumber = 0) {
+  const correct = question.options[question.correctIndex];
+  const distractors = question.options.filter((_, index) => index !== question.correctIndex);
+
+  // Guarantee a balanced A/B/C/D answer-key distribution instead of relying
+  // purely on randomness. The distractors are still shuffled.
+  for (let i = distractors.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [distractors[i], distractors[j]] = [distractors[j], distractors[i]];
+  }
+
+  const targetCorrectIndex = questionNumber % 4;
+  const options = [];
+  let distractorIndex = 0;
+
+  for (let i = 0; i < 4; i += 1) {
+    if (i === targetCorrectIndex) options.push(correct);
+    else options.push(distractors[distractorIndex++]);
+  }
+
+  return {
+    ...question,
+    options,
+    correctIndex: targetCorrectIndex
+  };
+}
+
+function dedupeAndShuffle(questions) {
+  const cleaned = cleanQuestions(questions);
+  return cleaned.map((question, index) => shuffleQuestionOptions(question, index));
+}
+
+function splitTranscript(transcript, targetChars = 48000) {
+  if (transcript.length <= targetChars) return [transcript];
+
+  const lines = transcript.split('\n');
+  const chunks = [];
+  let current = '';
+
+  for (const line of lines) {
+    const addition = current ? `\n${line}` : line;
+    if (current && current.length + addition.length > targetChars) {
+      chunks.push(current);
+      current = line;
+    } else {
+      current += addition;
+    }
+  }
+  if (current) chunks.push(current);
+  return chunks;
+}
+
+function buildPrompt(transcript, countInstruction, languageInstruction, chunkLabel = '') {
+  return `You are an expert educational assessment writer. Turn the supplied YouTube transcript into a multiple-choice practice quiz.
+
+Requirements:
+- Only ask questions whose answers are supported by the transcript.
+- Cover DIFFERENT facts and concepts across the transcript. Do not keep asking about the same definition or example.
+- Prioritize factual recall, concepts, definitions, comparisons, examples, cause/effect, applications, and exam-style understanding.
+- If the transcript contains explicit question-and-answer practice, convert those questions into quiz items and preserve the substance of the answers.
+- Avoid duplicates, vague wording, trick questions, and questions about the video itself.
+- Each question must have exactly 4 answer options.
+- Exactly one option is correct.
+- Put the correct answer at DIFFERENT positions (A/B/C/D) across the returned questions. Do not default to A.
+- Make distractors plausible but clearly wrong based on the lesson.
+- Include a concise explanation of why the correct answer is correct.
+- Use the timestamp in square brackets in the transcript to estimate the best sourceTimestampSeconds for each question. Use 0 when not reasonably determinable.
+- Keep question and option text concise enough for a quiz interface.
+- ${countInstruction}
+- ${languageInstruction}
+${chunkLabel ? `- This is ${chunkLabel}. Focus mainly on content in this section and avoid repeating obvious questions from other sections.\n` : ''}
+
+Return ONLY a JSON array in this shape:
+[
+  {
+    "question": "...",
+    "options": ["option 1", "option 2", "option 3", "option 4"],
+    "correctIndex": 0,
+    "explanation": "...",
+    "sourceTimestampSeconds": 0
+  }
+]
+
+Transcript:
+${transcript}`;
 }
 
 export default async function handler(req, res) {
@@ -235,86 +322,104 @@ export default async function handler(req, res) {
     const transcript = normalizeTranscript(transcriptData);
     if (!transcript.trim()) throw new Error('No transcript was found for this video.');
 
-    // Gemini 3.x has a 1M-token context window, so this is intentionally generous while
-    // still protecting the Vercel function from extremely large input payloads.
-    const maxChars = 300000;
-    const clippedTranscript = transcript.length > maxChars
-      ? transcript.slice(0, maxChars) + '\n[Transcript clipped for processing]'
-      : transcript;
-
-    const countInstruction = questionCount === 'all'
-      ? 'Generate as many distinct high-quality questions as the educational content reasonably supports. Do not pad with trivial or duplicate questions.'
-      : `Generate exactly ${Math.min(Math.max(Number(questionCount) || 10, 5), 50)} questions.`;
+    const requestedCount = questionCount === 'all'
+      ? null
+      : Math.min(Math.max(Number(questionCount) || 10, 5), 50);
 
     const languageInstruction = language === 'same'
       ? 'Write the quiz in the same primary language used in the transcript.'
       : `Write the quiz in ${language}.`;
 
-    const prompt = `You are an expert educational assessment writer. Turn the supplied YouTube transcript into a multiple-choice practice quiz.
+    // A single large AI request tends to produce only a small subset of the
+    // teachable material. For "all" mode, process the transcript in sections,
+    // generate question batches, then deduplicate them before returning the quiz.
+    const chunks = splitTranscript(transcript, 48000);
+    let targetPerChunk = requestedCount
+      ? Math.ceil(requestedCount / chunks.length)
+      : Math.min(15, Math.max(8, Math.ceil(16000 / 12000)));
 
-Requirements:
-- Only ask questions whose answers are supported by the transcript.
-- Prioritize factual recall, concepts, definitions, comparisons, examples, cause/effect, and exam-style understanding.
-- Avoid duplicates, vague wording, trick questions, and questions about the video itself (such as “who is speaking?”).
-- Each question must have exactly 4 answer options.
-- Exactly one option is correct.
-- Make distractors plausible but clearly wrong based on the lesson.
-- Include a concise explanation of why the correct answer is correct.
-- Use the timestamp in square brackets in the transcript to estimate the best sourceTimestampSeconds for each question. Use 0 when not reasonably determinable.
-- Keep question and option text concise enough for a quiz interface.
-- ${countInstruction}
-- ${languageInstruction}
-
-Return ONLY a JSON array in this shape:
-[
-  {
-    "question": "...",
-    "options": ["A", "B", "C", "D"],
-    "correctIndex": 0,
-    "explanation": "...",
-    "sourceTimestampSeconds": 0
-  }
-]
-
-Transcript:
-${clippedTranscript}`;
-
-    let geminiData = null;
-    const modelErrors = [];
-
-    for (const model of GEMINI_MODELS) {
-      try {
-        geminiData = await generateWithGemini(model, prompt);
-        break;
-      } catch (error) {
-        console.warn(`Gemini model ${model} failed:`, error.message);
-        modelErrors.push(error.message);
-      }
+    if (!requestedCount) {
+      // Longer videos deserve more questions. Cap to keep generation responsive.
+      targetPerChunk = transcript.length < 60000 ? 10 : transcript.length < 120000 ? 12 : 15;
     }
 
-    if (!geminiData) {
-      const last = modelErrors[modelErrors.length - 1] || 'AI generation failed.';
-      const allTemporary = modelErrors.every(message =>
-        /\b(429|500|502|503|504)\b|temporarily unavailable|temporarily rate-limited|timed out/i.test(message)
+    const allGenerated = [];
+    const modelErrors = [];
+
+    for (let i = 0; i < chunks.length; i += 1) {
+      const remaining = requestedCount ? requestedCount - allGenerated.length : Infinity;
+      if (requestedCount && remaining <= 0) break;
+
+      const batchCount = requestedCount
+        ? Math.min(targetPerChunk, remaining)
+        : targetPerChunk;
+
+      const countInstruction = `Generate ${batchCount} distinct questions from this transcript section. Cover different facts/concepts within this section.`;
+      const prompt = buildPrompt(
+        chunks[i],
+        countInstruction,
+        languageInstruction,
+        chunks.length > 1 ? `section ${i + 1} of ${chunks.length}` : ''
       );
 
+      let geminiData = null;
+      let lastBatchError = null;
+
+      for (const model of GEMINI_MODELS) {
+        try {
+          geminiData = await generateWithGemini(model, prompt);
+          break;
+        } catch (error) {
+          lastBatchError = error;
+          console.warn(`Gemini model ${model} failed for chunk ${i + 1}:`, error.message);
+          modelErrors.push(error.message);
+        }
+      }
+
+      if (!geminiData) {
+        // For "all" mode, do not lose the whole quiz because one section had a
+        // temporary model failure. Continue with other sections and report only
+        // if no usable questions were created at all.
+        if (requestedCount) throw lastBatchError || new Error('AI generation failed.');
+        continue;
+      }
+
+      const raw = extractGeminiText(geminiData);
+      let batch;
+      try {
+        batch = safeJsonParse(raw);
+      } catch (error) {
+        console.warn(`Invalid quiz JSON for chunk ${i + 1}:`, error.message);
+        continue;
+      }
+
+      allGenerated.push(...cleanQuestions(batch));
+    }
+
+    // Global dedupe after merging all sections, then shuffle every question's
+    // answer options so the correct answer is not systematically option A.
+    const finalQuestions = dedupeAndShuffle(allGenerated);
+
+    if (!finalQuestions.length) {
+      const allTemporary = modelErrors.length > 0 && modelErrors.every(message =>
+        /\b(429|500|502|503|504)\b|temporarily unavailable|temporarily rate-limited|timed out/i.test(message)
+      );
       if (allTemporary) {
         throw new Error('Gemini is temporarily busy across the available models. Please wait a little and try Generate Quiz again. The app automatically retried and switched models.');
       }
-      throw new Error(last);
+      throw new Error('No usable questions were generated. Please try another educational video.');
     }
 
-    const raw = extractGeminiText(geminiData);
-    const questions = safeJsonParse(raw);
-    const cleaned = cleanQuestions(questions);
-
-    if (!cleaned.length) throw new Error('No usable questions were generated. Please try another educational video.');
+    // For a fixed count, return up to the requested number after global dedupe.
+    // For "all", return everything we could support from the transcript chunks.
+    const result = requestedCount ? finalQuestions.slice(0, requestedCount) : finalQuestions;
 
     return json(res, 200, {
       videoId: getYoutubeId(url),
       language: transcriptData.lang || 'unknown',
-      questionCount: cleaned.length,
-      questions: cleaned
+      questionCount: result.length,
+      questions: result,
+      sectionsProcessed: chunks.length
     }, origin);
   } catch (error) {
     console.error(error);
