@@ -206,36 +206,56 @@ function cleanQuestions(questions) {
   return cleaned;
 }
 
-function shuffleQuestionOptions(question, questionNumber = 0) {
-  const correct = question.options[question.correctIndex];
-  const distractors = question.options.filter((_, index) => index !== question.correctIndex);
-
-  // Guarantee a balanced A/B/C/D answer-key distribution instead of relying
-  // purely on randomness. The distractors are still shuffled.
-  for (let i = distractors.length - 1; i > 0; i -= 1) {
+function fisherYates(items) {
+  const copy = [...items];
+  for (let i = copy.length - 1; i > 0; i -= 1) {
     const j = Math.floor(Math.random() * (i + 1));
-    [distractors[i], distractors[j]] = [distractors[j], distractors[i]];
+    [copy[i], copy[j]] = [copy[j], copy[i]];
   }
+  return copy;
+}
 
-  const targetCorrectIndex = questionNumber % 4;
-  const options = [];
-  let distractorIndex = 0;
-
-  for (let i = 0; i < 4; i += 1) {
-    if (i === targetCorrectIndex) options.push(correct);
-    else options.push(distractors[distractorIndex++]);
-  }
+function shuffleQuestionOptions(question) {
+  // Truly randomize all four answer positions. The previous version forced
+  // A/B/C/D in sequence, which made the answer key predictable.
+  const pairs = question.options.map((label, index) => ({
+    label,
+    isCorrect: index === question.correctIndex
+  }));
+  const shuffled = fisherYates(pairs);
 
   return {
     ...question,
-    options,
-    correctIndex: targetCorrectIndex
+    options: shuffled.map(item => item.label),
+    correctIndex: shuffled.findIndex(item => item.isCorrect)
   };
 }
 
 function dedupeAndShuffle(questions) {
   const cleaned = cleanQuestions(questions);
-  return cleaned.map((question, index) => shuffleQuestionOptions(question, index));
+  const shuffledQuestions = fisherYates(cleaned);
+
+  // Try to avoid obvious answer-key patterns (e.g. A,A,A,A) while keeping
+  // the final positions genuinely random. Never force an A/B/C/D sequence.
+  let best = shuffledQuestions.map(q => shuffleQuestionOptions(q));
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    const candidate = shuffledQuestions.map(q => shuffleQuestionOptions(q));
+    const keys = candidate.map(q => q.correctIndex);
+    let penalty = 0;
+    for (let i = 1; i < keys.length; i += 1) {
+      if (keys[i] === keys[i - 1]) penalty += 1;
+      if (i > 1 && keys[i] === keys[i - 1] && keys[i] === keys[i - 2]) penalty += 3;
+    }
+    const bestKeys = best.map(q => q.correctIndex);
+    let bestPenalty = 0;
+    for (let i = 1; i < bestKeys.length; i += 1) {
+      if (bestKeys[i] === bestKeys[i - 1]) bestPenalty += 1;
+      if (i > 1 && bestKeys[i] === bestKeys[i - 1] && bestKeys[i] === bestKeys[i - 2]) bestPenalty += 3;
+    }
+    if (penalty < bestPenalty) best = candidate;
+    if (penalty === 0) break;
+  }
+  return best;
 }
 
 function splitTranscript(transcript, targetChars = 48000) {
@@ -269,7 +289,7 @@ Requirements:
 - Avoid duplicates, vague wording, trick questions, and questions about the video itself.
 - Each question must have exactly 4 answer options.
 - Exactly one option is correct.
-- Put the correct answer at DIFFERENT positions (A/B/C/D) across the returned questions. Do not default to A.
+- Randomize the correct answer position across A/B/C/D. Do not use a fixed sequence or a predictable pattern.
 - Make distractors plausible but clearly wrong based on the lesson.
 - Include a concise explanation of why the correct answer is correct.
 - Use the timestamp in square brackets in the transcript to estimate the best sourceTimestampSeconds for each question. Use 0 when not reasonably determinable.
@@ -334,14 +354,13 @@ export default async function handler(req, res) {
     // teachable material. For "all" mode, process the transcript in sections,
     // generate question batches, then deduplicate them before returning the quiz.
     const chunks = splitTranscript(transcript, 48000);
-    let targetPerChunk = requestedCount
-      ? Math.ceil(requestedCount / chunks.length)
-      : Math.min(15, Math.max(8, Math.ceil(16000 / 12000)));
-
-    if (!requestedCount) {
-      // Longer videos deserve more questions. Cap to keep generation responsive.
-      targetPerChunk = transcript.length < 60000 ? 10 : transcript.length < 120000 ? 12 : 15;
-    }
+    // "All useful questions" should aggressively cover the lesson rather than
+    // stopping at 8-10 items. For fixed-count mode we still honor the user's
+    // requested total. For all-mode, generate a healthy batch per transcript
+    // section and optionally run a second pass when the model under-produces.
+    const targetPerChunk = requestedCount
+      ? Math.max(1, Math.ceil(requestedCount / chunks.length))
+      : 20;
 
     const allGenerated = [];
     const modelErrors = [];
@@ -354,46 +373,56 @@ export default async function handler(req, res) {
         ? Math.min(targetPerChunk, remaining)
         : targetPerChunk;
 
-      const countInstruction = `Generate ${batchCount} distinct questions from this transcript section. Cover different facts/concepts within this section.`;
-      const prompt = buildPrompt(
+      const makePrompt = (count, extra = '') => buildPrompt(
         chunks[i],
-        countInstruction,
+        `${count ? `Generate ${count} ` : 'Generate as many as reasonably possible, ideally 20 '}distinct questions from this transcript section. Cover different facts/concepts within this section. ${extra}`,
         languageInstruction,
         chunks.length > 1 ? `section ${i + 1} of ${chunks.length}` : ''
       );
 
-      let geminiData = null;
-      let lastBatchError = null;
+      async function runBatch(prompt) {
+        let geminiData = null;
+        let lastBatchError = null;
+        for (const model of GEMINI_MODELS) {
+          try {
+            geminiData = await generateWithGemini(model, prompt);
+            break;
+          } catch (error) {
+            lastBatchError = error;
+            console.warn(`Gemini model ${model} failed for chunk ${i + 1}:`, error.message);
+            modelErrors.push(error.message);
+          }
+        }
+        if (!geminiData) return { questions: [], error: lastBatchError };
 
-      for (const model of GEMINI_MODELS) {
+        const raw = extractGeminiText(geminiData);
         try {
-          geminiData = await generateWithGemini(model, prompt);
-          break;
+          return { questions: cleanQuestions(safeJsonParse(raw)), error: null };
         } catch (error) {
-          lastBatchError = error;
-          console.warn(`Gemini model ${model} failed for chunk ${i + 1}:`, error.message);
-          modelErrors.push(error.message);
+          console.warn(`Invalid quiz JSON for chunk ${i + 1}:`, error.message);
+          return { questions: [], error };
         }
       }
 
-      if (!geminiData) {
-        // For "all" mode, do not lose the whole quiz because one section had a
-        // temporary model failure. Continue with other sections and report only
-        // if no usable questions were created at all.
-        if (requestedCount) throw lastBatchError || new Error('AI generation failed.');
-        continue;
+      const firstBatch = await runBatch(makePrompt(batchCount));
+
+      if (!firstBatch.questions.length && requestedCount) {
+        throw firstBatch.error || new Error('AI generation failed.');
       }
 
-      const raw = extractGeminiText(geminiData);
-      let batch;
-      try {
-        batch = safeJsonParse(raw);
-      } catch (error) {
-        console.warn(`Invalid quiz JSON for chunk ${i + 1}:`, error.message);
-        continue;
-      }
+      allGenerated.push(...firstBatch.questions);
 
-      allGenerated.push(...cleanQuestions(batch));
+      // In all-mode, ask for another unseen batch whenever the first pass
+      // returns noticeably fewer questions than requested for the section.
+      // This is what prevents a long lesson from collapsing to just 10 items.
+      if (!requestedCount && firstBatch.questions.length < Math.max(12, Math.floor(batchCount * 0.65))) {
+        const existing = firstBatch.questions
+          .map(q => q.question)
+          .slice(0, 40)
+          .join(' | ');
+        const secondBatch = await runBatch(makePrompt(20, `This is a SECOND coverage pass. Do not repeat or rephrase any of these already-generated questions: ${existing}. Find additional teachable facts, examples, comparisons, terminology, mechanisms, applications, and explicit practice questions that were missed in the first pass.`));
+        allGenerated.push(...secondBatch.questions);
+      }
     }
 
     // Global dedupe after merging all sections, then shuffle every question's

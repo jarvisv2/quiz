@@ -178,7 +178,7 @@ function App() {
           </section>
         )}
       </main>
-      <footer>QuizTube AI • Built for educational practice • AI-generated questions should still be reviewed for high-stakes exams.</footer>
+      <footer>QuizTube AI • Built for educational practice • AI-generated questions should still be reviewed for high-stakes exams.<div className="credits">Built by <a href="https://www.instagram.com/darkshadeoflove" target="_blank" rel="noreferrer">Instagram @darkshadeoflove</a> <span>•</span> <a href="https://github.com/jarvisv2" target="_blank" rel="noreferrer">GitHub @jarvisv2</a></div></footer>
     </div>
   );
 }
